@@ -1083,7 +1083,7 @@ function panBy(dx,dy){ const s=radius*0.0013;
   const right=new T.Vector3().subVectors(camera.position,target).cross(camera.up).normalize();
   panOffset.addScaledVector(right,-dx*s); panOffset.addScaledVector(new T.Vector3(0,1,0), dy*s); }
 canvas.addEventListener('pointerdown',e=>{ canvas.setPointerCapture(e.pointerId);
-  ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY}); dragging=true; idleT=0;
+  ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY}); dragging=true; idleT=0; framedByUser=true;
   if(ptrs.size===2){ const a=[...ptrs.values()]; pinchPrev=Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y);
     panMidPrev={x:(a[0].x+a[1].x)/2,y:(a[0].y+a[1].y)/2}; }});
 canvas.addEventListener('contextmenu',e=>e.preventDefault());
@@ -1107,7 +1107,7 @@ canvas.addEventListener('pointermove',e=>{
     else { tTheta-=dx*0.005; tPhi-=dy*0.005; tPhi=Math.max(0.12,Math.min(1.5,tPhi)); }
   }
 });
-canvas.addEventListener('wheel',e=>{e.preventDefault(); tRadius*=(1+(e.deltaY>0?1:-1)*0.08); tRadius=Math.max(9,Math.min(60,tRadius));},{passive:false});
+canvas.addEventListener('wheel',e=>{e.preventDefault(); framedByUser=true; tRadius*=(1+(e.deltaY>0?1:-1)*0.08); tRadius=Math.max(9,Math.min(60,tRadius));},{passive:false});
 
 /* ============================================================
    UI WIRING
@@ -1125,7 +1125,11 @@ let bloomOn=true, dofOn=false;
 const bBloom=document.getElementById('bBloom'), bDof=document.getElementById('bDof');
 bBloom.onclick=()=>{bloomOn=!bloomOn;bBloom.classList.toggle('on',bloomOn);};
 bDof.onclick=()=>{dofOn=!dofOn;bDof.classList.toggle('on',dofOn);};
-document.getElementById('bReset').onclick=()=>{tTheta=0.78;tPhi=0.98;tRadius=27;panOffset.set(0,0,0);idleT=0;};
+document.getElementById('bReset').onclick=()=>{
+  const th=theta, ph=phi;                       // fit for the angle we are easing towards…
+  theta=tTheta=0.78; phi=tPhi=0.98; framedByUser=false; fitView();
+  theta=th; phi=ph; updateCam(); idleT=0;       // …then let the damping glide there
+};
 const bCine=document.getElementById('bCine');
 bCine.onclick=()=>{document.body.classList.add('cine');};
 document.getElementById('bCineExit').onclick=()=>{document.body.classList.remove('cine');};
@@ -1145,6 +1149,79 @@ if(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matc
 }
 
 /* ============================================================
+   AUTO-FIT — keep the skid centred and evenly framed at any aspect.
+   The world-space centre of the equipment is NOT its optical centre: the
+   near side of the skid projects larger and lower, so a fixed target/radius
+   drifts the model towards the bottom-right on wide screens. Fit against the
+   PROJECTED bounds instead and iterate until they sit centred in the frame.
+   ============================================================ */
+const FIT_SKIP=[floor,grid,flowGroup,dynGroup];   // ground plane, polar grid, animated flow cores
+const FIT_FILL_X=0.92, FIT_FILL_Y=0.78;           // fraction of the USABLE area the skid should span
+let fitPts=null, fitSprites=null, framedByUser=false;
+// Sample the real silhouette — per-mesh corners, not one big scene box. A single
+// box overstates the extent badly under perspective (its empty back-top corners
+// project further out than any actual steel), which is what let the model drift.
+function collectFit(){
+  fitPts=[]; fitSprites=[];
+  const tmp=new T.Box3();
+  scene.traverse(o=>{
+    for(let p=o;p;p=p.parent){ if(FIT_SKIP.indexOf(p)>=0) return; }
+    if(o.isMesh){
+      tmp.setFromObject(o); if(tmp.isEmpty()) return;
+      for(let i=0;i<8;i++) fitPts.push(new T.Vector3(i&1?tmp.max.x:tmp.min.x, i&2?tmp.max.y:tmp.min.y, i&4?tmp.max.z:tmp.min.z));
+    } else if(o.isSprite){                        // billboard labels are part of what the eye frames
+      fitSprites.push({p:o.getWorldPosition(new T.Vector3()), w:o.scale.x, h:o.scale.y});
+    }
+  });
+}
+function ndcBounds(){
+  const b={x0:1e9,x1:-1e9,y0:1e9,y1:-1e9}, v=new T.Vector3();
+  const grow=(x,y)=>{ if(x<b.x0)b.x0=x; if(x>b.x1)b.x1=x; if(y<b.y0)b.y0=y; if(y>b.y1)b.y1=y; };
+  for(const p of fitPts){ v.copy(p).project(camera); grow(v.x,v.y); }
+  const halfTan=Math.tan(camera.fov*Math.PI/360);
+  for(const s of fitSprites){
+    const d=Math.max(0.001,s.p.distanceTo(camera.position));
+    v.copy(s.p).project(camera);
+    const dx=(s.w/2)/(halfTan*d*camera.aspect), dy=(s.h/2)/(halfTan*d);
+    grow(v.x-dx,v.y-dy); grow(v.x+dx,v.y+dy);
+  }
+  return b;
+}
+// The HUD cards sit in the corners, so the frame the model may occupy is
+// narrower than the window. Keep the model centred on the window but sized to
+// clear the widest card on either side — on a small screen that means smaller,
+// on a large one the cards cost almost nothing.
+function usableSpan(){
+  const box=id=>{ const e=document.getElementById(id);
+    if(!e||document.body.classList.contains('cine')) return null;
+    if(e.classList.contains('card')&&document.body.classList.contains('hud-off')) return null;
+    const r=e.getBoundingClientRect(); return r.width?r:null; };
+  let side=0;
+  for(const id of ['head','ratios']){ const r=box(id); if(r) side=Math.max(side,r.right+16); }
+  for(const id of ['mode','foot']){ const r=box(id); if(r) side=Math.max(side,W-r.left+16); }
+  side=Math.min(side,W*0.20);                     // a card never eats more than a fifth of the frame
+  return {x:Math.max(0.3,(W-2*side)/W), y:1};
+}
+function fitView(){
+  if(!fitPts) collectFit();
+  if(!fitPts.length) return;
+  panOffset.set(0,0,0); radius=27;                // deterministic start, so repeated fits agree
+  const use=usableSpan(), fillX=FIT_FILL_X*use.x, fillY=FIT_FILL_Y*use.y;
+  const right=new T.Vector3(), up=new T.Vector3(), fwd=new T.Vector3();
+  for(let i=0;i<10;i++){
+    updateCam(); camera.updateMatrixWorld(true);
+    const b=ndcBounds();
+    radius=Math.max(9,Math.min(60,radius*Math.max((b.x1-b.x0)/(2*fillX),(b.y1-b.y0)/(2*fillY))));
+    updateCam(); camera.updateMatrixWorld(true);
+    const c=ndcBounds(), cx=(c.x0+c.x1)/2, cy=(c.y0+c.y1)/2;
+    const halfH=Math.tan(camera.fov*Math.PI/360)*radius, halfW=halfH*camera.aspect;
+    camera.matrixWorld.extractBasis(right,up,fwd);
+    panOffset.addScaledVector(right,cx*halfW).addScaledVector(up,cy*halfH);
+  }
+  tRadius=radius; updateCam();
+}
+
+/* ============================================================
    RESIZE
    ============================================================ */
 let W=1,H=1;
@@ -1156,6 +1233,7 @@ function resize(){ W=Math.max(2,innerWidth); H=Math.max(2,innerHeight);
     compositeMat.uniforms.uRes.value.set(pw,ph);
     compositeMat.uniforms.uNear.value=camera.near; compositeMat.uniforms.uFar.value=camera.far;
   }
+  if(!framedByUser) fitView();                    // re-frame unless the viewer has zoomed/panned
 }
 addEventListener('resize',resize); resize(); updateCam();
 
