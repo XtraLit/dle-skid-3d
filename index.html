@@ -850,6 +850,7 @@ function clearFlow(){
   for(let k=flowGroup.children.length-1;k>=0;k--){ const c=flowGroup.children[k];
     c.geometry.dispose(); const idx=flowMats.indexOf(c.material); if(idx>=0)flowMats.splice(idx,1); c.material.dispose(); flowGroup.remove(c);}
   for(let k=dynGroup.children.length-1;k>=0;k--){ const c=dynGroup.children[k]; c.geometry.dispose(); dynGroup.remove(c);}
+  fitPts=null;                                    // routing changed → the silhouette the auto-fit measured is stale
 }
 const COL_BRINE='#5ab0ff', COL_ACID='#f3df72', COL_ELU='#3ff0a4', COL_SPENT='#7fbfd6';
 
@@ -1065,8 +1066,12 @@ function applyConfig(){
    ============================================================ */
 const target=new T.Vector3(0,1.9,0);
 let theta=0.78,phi=0.98,radius=27;
+// How far the camera may pull back. A very narrow window (phone upright, a
+// split-screen column) needs far more than a desktop one to hold the whole
+// skid, and the auto-fit must not be capped before it has framed it.
+const ZOOM_OUT_MAX=90;
 let tTheta=theta,tPhi=phi,tRadius=radius;
-const panOffset=new T.Vector3();
+const panOffset=new T.Vector3(), tPan=new T.Vector3();   // tPan = where the auto-fit wants the frame
 function updateCam(){
   const sp=Math.sin(phi);
   const pos=new T.Vector3(
@@ -1081,7 +1086,8 @@ const ptrs=new Map();                 // pointerId -> {x,y}
 let pinchPrev=0, panMidPrev=null;
 function panBy(dx,dy){ const s=radius*0.0013;
   const right=new T.Vector3().subVectors(camera.position,target).cross(camera.up).normalize();
-  panOffset.addScaledVector(right,-dx*s); panOffset.addScaledVector(new T.Vector3(0,1,0), dy*s); }
+  panOffset.addScaledVector(right,-dx*s); panOffset.addScaledVector(new T.Vector3(0,1,0), dy*s);
+  tPan.copy(panOffset); }                         // hand control to the viewer — don't ease back
 canvas.addEventListener('pointerdown',e=>{ canvas.setPointerCapture(e.pointerId);
   ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY}); dragging=true; idleT=0; framedByUser=true;
   if(ptrs.size===2){ const a=[...ptrs.values()]; pinchPrev=Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y);
@@ -1097,7 +1103,7 @@ canvas.addEventListener('pointermove',e=>{
     ptrs.set(e.pointerId,{x:nx,y:ny});
     const a=[...ptrs.values()];
     const d=Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y);
-    if(pinchPrev>0){ tRadius*=pinchPrev/Math.max(1,d); tRadius=Math.max(9,Math.min(60,tRadius)); }
+    if(pinchPrev>0){ tRadius*=pinchPrev/Math.max(1,d); tRadius=Math.max(9,Math.min(ZOOM_OUT_MAX,tRadius)); }
     const mid={x:(a[0].x+a[1].x)/2,y:(a[0].y+a[1].y)/2};
     if(panMidPrev) panBy(mid.x-panMidPrev.x, mid.y-panMidPrev.y);
     pinchPrev=d; panMidPrev=mid;
@@ -1107,7 +1113,7 @@ canvas.addEventListener('pointermove',e=>{
     else { tTheta-=dx*0.005; tPhi-=dy*0.005; tPhi=Math.max(0.12,Math.min(1.5,tPhi)); }
   }
 });
-canvas.addEventListener('wheel',e=>{e.preventDefault(); framedByUser=true; tRadius*=(1+(e.deltaY>0?1:-1)*0.08); tRadius=Math.max(9,Math.min(60,tRadius));},{passive:false});
+canvas.addEventListener('wheel',e=>{e.preventDefault(); framedByUser=true; tRadius*=(1+(e.deltaY>0?1:-1)*0.08); tRadius=Math.max(9,Math.min(ZOOM_OUT_MAX,tRadius));},{passive:false});
 
 /* ============================================================
    UI WIRING
@@ -1127,7 +1133,7 @@ bBloom.onclick=()=>{bloomOn=!bloomOn;bBloom.classList.toggle('on',bloomOn);};
 bDof.onclick=()=>{dofOn=!dofOn;bDof.classList.toggle('on',dofOn);};
 document.getElementById('bReset').onclick=()=>{
   const th=theta, ph=phi;                       // fit for the angle we are easing towards…
-  theta=tTheta=0.78; phi=tPhi=0.98; framedByUser=false; fitView();
+  theta=tTheta=0.78; phi=tPhi=0.98; framedByUser=false; fitView(false);
   theta=th; phi=ph; updateCam(); idleT=0;       // …then let the damping glide there
 };
 const bCine=document.getElementById('bCine');
@@ -1155,9 +1161,11 @@ if(window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matc
    drifts the model towards the bottom-right on wide screens. Fit against the
    PROJECTED bounds instead and iterate until they sit centred in the frame.
    ============================================================ */
-const FIT_SKIP=[floor,grid,flowGroup,dynGroup];   // ground plane, polar grid, animated flow cores
-const FIT_FILL_X=0.92, FIT_FILL_Y=0.78;           // fraction of the USABLE area the skid should span
-let fitPts=null, fitSprites=null, framedByUser=false;
+const FIT_SKIP=[floor,grid,flowGroup];            // ground plane + polar grid: backdrop, not subject.
+                                                  // The routed jumpers (dynGroup) ARE part of the silhouette —
+                                                  // leaving them out let the manifold hang off the frame edge.
+const FIT_FILL_X=0.95, FIT_FILL_Y=0.84;           // fraction of the USABLE area the skid should span
+let fitPts=null, fitSprites=null, framedByUser=false, fitAcc=0;
 // Sample the real silhouette — per-mesh corners, not one big scene box. A single
 // box overstates the extent badly under perspective (its empty back-top corners
 // project further out than any actual steel), which is what let the model drift.
@@ -1202,23 +1210,36 @@ function usableSpan(){
   side=Math.min(side,W*0.20);                     // a card never eats more than a fifth of the frame
   return {x:Math.max(0.3,(W-2*side)/W), y:1};
 }
-function fitView(){
+// Solve the framing for the CURRENT camera angle without disturbing the live
+// camera: returns the {radius, pan} that centre the silhouette, and puts the
+// camera back exactly where it was.
+const _fitRight=new T.Vector3(), _fitUp=new T.Vector3(), _fitFwd=new T.Vector3();
+function solveFit(){
   if(!fitPts) collectFit();
-  if(!fitPts.length) return;
+  if(!fitPts.length) return null;
+  const r0=radius, p0=panOffset.clone();
   panOffset.set(0,0,0); radius=27;                // deterministic start, so repeated fits agree
   const use=usableSpan(), fillX=FIT_FILL_X*use.x, fillY=FIT_FILL_Y*use.y;
-  const right=new T.Vector3(), up=new T.Vector3(), fwd=new T.Vector3();
-  for(let i=0;i<10;i++){
+  for(let i=0;i<8;i++){
     updateCam(); camera.updateMatrixWorld(true);
     const b=ndcBounds();
-    radius=Math.max(9,Math.min(60,radius*Math.max((b.x1-b.x0)/(2*fillX),(b.y1-b.y0)/(2*fillY))));
+    radius=Math.max(9,Math.min(ZOOM_OUT_MAX,radius*Math.max((b.x1-b.x0)/(2*fillX),(b.y1-b.y0)/(2*fillY))));
     updateCam(); camera.updateMatrixWorld(true);
     const c=ndcBounds(), cx=(c.x0+c.x1)/2, cy=(c.y0+c.y1)/2;
     const halfH=Math.tan(camera.fov*Math.PI/360)*radius, halfW=halfH*camera.aspect;
-    camera.matrixWorld.extractBasis(right,up,fwd);
-    panOffset.addScaledVector(right,cx*halfW).addScaledVector(up,cy*halfH);
+    camera.matrixWorld.extractBasis(_fitRight,_fitUp,_fitFwd);
+    panOffset.addScaledVector(_fitRight,cx*halfW).addScaledVector(_fitUp,cy*halfH);
   }
-  tRadius=radius; updateCam();
+  const sol={r:radius, p:panOffset.clone()};
+  radius=r0; panOffset.copy(p0); updateCam(); camera.updateMatrixWorld(true);
+  return sol;
+}
+// snap=true jumps to the solution (load, resize, reset); snap=false only moves
+// the easing targets, so the frame glides while the turntable orbits.
+function fitView(snap){
+  const s=solveFit(); if(!s) return;
+  tRadius=s.r; tPan.copy(s.p);
+  if(snap!==false){ radius=s.r; panOffset.copy(s.p); updateCam(); }
 }
 
 /* ============================================================
@@ -1248,7 +1269,11 @@ function tick(){
   if(autoOrbit && !dragging){ idleT+=dt; if(idleT>1.2) tTheta+=dt*0.06; }
   theta+=(tTheta-theta)*Math.min(1,dt*8);
   phi+=(tPhi-phi)*Math.min(1,dt*8);
+  // Re-solve the framing a few times a second while the turntable turns: a skid
+  // is long, so a fit made for one angle drifts the model off-frame at the next.
+  if(!framedByUser){ fitAcc+=dt; if(fitAcc>0.25){ fitAcc=0; fitView(false); } }
   radius+=(tRadius-radius)*Math.min(1,dt*8);
+  panOffset.lerp(tPan,Math.min(1,dt*3));
   updateCam();
 
   // flow shaders
@@ -1332,7 +1357,9 @@ function tick(){
 
   requestAnimationFrame(tick);
 }
-applyConfig(); tick();
+applyConfig();
+fitView();          // the routing/labels applyConfig just built are part of the silhouette — frame THAT
+tick();
 })();
 </script>
 </body>
