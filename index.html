@@ -16,7 +16,12 @@
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;overflow:hidden;font-family:var(--sans);color:var(--ink);
     background:radial-gradient(130% 130% at 72% -10%,#11252e 0%,var(--bg1) 38%,var(--bg0) 100%);}
-  #scene{position:fixed;inset:0;display:block;touch-action:none}
+  /* width/height MUST be explicit. A canvas is a replaced element, so with
+     width:auto the insets do not stretch it — it takes its intrinsic size, the
+     drawing buffer (viewport × devicePixelRatio). On a scaled display (125 %,
+     150 %) that is larger than the window, anchored top-left, and the render
+     spills off the bottom-right of the screen. */
+  #scene{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
   .ui{position:fixed;z-index:5;pointer-events:none;transition:opacity .35s ease, transform .35s ease}
   body.cine .ui{opacity:0;transform:translateY(6px);pointer-events:none!important}
   body.cine #cineExit{opacity:1;transform:none;pointer-events:auto}
