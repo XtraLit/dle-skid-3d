@@ -5,7 +5,7 @@
 
 ## Демо
 
-**https://igorkant.github.io/dle-skid-3d/**
+**https://xtralit.github.io/dle-skid-3d/**
 
 ## Использование
 
